@@ -35,14 +35,14 @@ import numpy as np
 # ----------------------------------------------------------------------------
 # PARAMETRIT (muuta näitä tarvittaessa)
 # ----------------------------------------------------------------------------
-LINKKEJA_MIN = 20           # puumallin linkkien määrä l arvotaan väliltä
-LINKKEJA_MAX = 100
+LINKKEJA_MIN = 200           # puumallin linkkien määrä l arvotaan väliltä
+LINKKEJA_MAX = 1000
 ASTE_MIN = 1                # jokainen solmu yhteydessä 1...4 muuhun solmuun
 ASTE_MAX = 4
-PITUUS_MIN, PITUUS_MAX = 100.0, 5000.0      # m
+PITUUS_MIN, PITUUS_MAX = 100.0, 500.0      # m
 KARHEUS_MIN, KARHEUS_MAX = 1e-5, 1e-4       # m (luku 2.2)
 D_DN32 = 0.032              # m, kuluttajaan saapuvan putken halkaisija (DN32)
-SML_MAARA = 1               # kuinka monta ylimääräistä linkkiä lisätään
+SML_MAARA = 40               # kuinka monta ylimääräistä linkkiä (= sykliä) lisätään
 TIEDOSTO = "network_data.npz"
 
 
@@ -189,6 +189,78 @@ def maarita_halkaisijat(n_solmut: int, edges: np.ndarray, kuluttajat: np.ndarray
 
 
 # ============================================================================
+# 4b) TARKISTUSTYÖKALU
+# ============================================================================
+def tarkista_verkko(n_solmut: int, edges: np.ndarray, n_puun_linkit: int | None = None,
+                    max_lahtevat: int = ASTE_MAX, max_aste: int = ASTE_MAX) -> bool:
+    """
+    Tarkistaa, että verkko täyttää PI:n ehdot. Tulostaa raportin ja pysäyttää
+    ohjelman (AssertionError), jos jokin ehto ei täyty:
+      1) mistään solmusta ei lähde yli max_lahtevat (4) linkkiä, eli ei 5 tai enempää
+      2) yksikään solmu ei ole yhteydessä yli max_aste (4) muuhun solmuun
+         (saapuvat + lähtevät linkit, luku 3.1)
+      3) ei silmukoita (u == v) eikä samaa linkkiä kahdesti (kumpaankaan suuntaan)
+      4) kaikki linkit kulkevat pienemmästä indeksistä suurempaan (u < v),
+         jolloin nimellissuunnissa ei ole kehää
+      5) kaikkiin solmuihin päästään 0-solmusta nimellissuuntaa pitkin
+      6) SML:ien määrä = l - (m - 1), eli jokainen ylimääräinen linkki tekee yhden syklin
+    """
+    edges = np.asarray(edges)
+    lahtevat = np.bincount(edges[:, 0], minlength=n_solmut)
+    saapuvat = np.bincount(edges[:, 1], minlength=n_solmut)
+    aste = lahtevat + saapuvat
+    parit = [tuple(sorted(map(int, e))) for e in edges]
+
+    # 5) saavutettavuus leveyshaulla
+    ulos = [[] for _ in range(n_solmut)]
+    for u, v in edges:
+        ulos[u].append(v)
+    kayty = np.zeros(n_solmut, dtype=bool); kayty[0] = True
+    jono = [0]
+    while jono:
+        for v in ulos[jono.pop()]:
+            if not kayty[v]:
+                kayty[v] = True; jono.append(v)
+
+    tulokset = [
+        (f"Lähteviä linkkejä solmusta enintään {max_lahtevat}",
+         lahtevat.max() <= max_lahtevat,
+         f"max {lahtevat.max()} (solmu {int(lahtevat.argmax())})"),
+        (f"Solmun yhteyksiä enintään {max_aste}",
+         aste.max() <= max_aste,
+         f"max {aste.max()} (solmu {int(aste.argmax())})"),
+        ("Ei silmukoita eikä tuplalinkkejä",
+         all(u != v for u, v in edges) and len(set(parit)) == len(parit), ""),
+        ("Linkit suunnattu u < v (ei kehiä nimellissuunnissa)",
+         bool(np.all(edges[:, 0] < edges[:, 1])), ""),
+        ("Kaikkiin solmuihin päästään 0-solmusta",
+         bool(kayty.all()), f"saavuttamatta {np.where(~kayty)[0].tolist()}" if not kayty.all() else ""),
+    ]
+    sml_maara = len(edges) - (n_solmut - 1)
+    if n_puun_linkit is not None:
+        tulokset.append(("SML:ien määrä = l - (m - 1)", sml_maara == len(edges) - n_puun_linkit,
+                         f"{sml_maara} sykliä"))
+
+    print("[PI] Tarkistus:")
+    for nimi, ok, lisa in tulokset:
+        print(f"     {'OK  ' if ok else 'VIRHE'} {nimi}{'  (' + lisa + ')' if lisa else ''}")
+    jakauma = np.bincount(lahtevat)
+    print("     Lähtevien linkkien jakauma: " + ", ".join(f"{k} kpl: {n} solmua" for k, n in enumerate(jakauma) if n))
+    virheet = [nimi for nimi, ok, _ in tulokset if not ok]
+    assert not virheet, f"Verkon tarkistus epäonnistui: {virheet}"
+    return True
+
+
+def tarkista_tiedosto(tiedosto: str = TIEDOSTO) -> bool:
+    """Tarkistaa valmiin network_data.npz-tiedoston samalla työkalulla."""
+    data = np.load(tiedosto)
+    edges = data["edges"].astype(int)
+    n_solmut = int(edges.max()) + 1
+    print(f"[PI] Tarkistetaan {tiedosto}: {n_solmut} solmua, {len(edges)} linkkiä")
+    return tarkista_verkko(n_solmut, edges)
+
+
+# ============================================================================
 # 4) KOKO VERKON LUONTI JA TALLENNUS
 # ============================================================================
 def yhdistymismatriisi(edges: np.ndarray, n_solmut: int) -> np.ndarray:
@@ -204,13 +276,20 @@ def luo_verkko(seed: Optional[int] = 42, tallenna: bool = True) -> Verkko:
     rng = random.Random(seed)
 
     # --- Puumalli ---
-    n_solmut, puun_linkit = luo_puumalli(rng)
-    kuluttajat = etsi_lehdet(n_solmut, puun_linkit)
+    # Jokainen SML vaatii kaksi omaa lehtisolmua, joten puu arvotaan uudelleen,
+    # kunnes lehtiä on vähintään 2 * SML_MAARA.
+    for _ in range(1000):
+        n_solmut, puun_linkit = luo_puumalli(rng)
+        kuluttajat = etsi_lehdet(n_solmut, puun_linkit)
+        if len(kuluttajat) >= 2 * SML_MAARA:
+            break
+    else:
+        raise RuntimeError(f"Puuhun ei saatu {2 * SML_MAARA} lehtisolmua. Pienennä SML_MAARA-arvoa.")
     print(f"[PI] Puumalli: {n_solmut} solmua, {len(puun_linkit)} linkkiä, "
           f"{len(kuluttajat)} lehtisolmua (kuluttajaa)")
 
     # --- SML ---
-    sml = lisaa_sml(puun_linkit, kuluttajat, rng)
+    sml = lisaa_sml(puun_linkit, kuluttajat, rng, maara=SML_MAARA)
     kaikki = puun_linkit + sml
     edges = np.array(kaikki, dtype=np.int32)
     sml_indeksit = np.arange(len(puun_linkit), len(kaikki), dtype=np.int32)
@@ -230,6 +309,8 @@ def luo_verkko(seed: Optional[int] = 42, tallenna: bool = True) -> Verkko:
     print(f"[PI] Halkaisijat: min {D.min()*1000:.1f} mm, max {D.max()*1000:.1f} mm "
           f"(0-solmusta lähtevät: {', '.join(f'{d*1000:.1f}' for d in D[edges[:, 0] == 0])} mm)")
     print(f"[PI] Pituudet: {L.min():.0f}–{L.max():.0f} m, karheudet: {eps.min():.2e}–{eps.max():.2e} m")
+
+    tarkista_verkko(n_solmut, edges, len(puun_linkit))   # pysäyttää ohjelman, jos verkossa on virhe
 
     if tallenna:
         np.savez(TIEDOSTO, edges=edges, edge_features=edge_features, adjacency=adjacency,
